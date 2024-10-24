@@ -19,22 +19,26 @@ def namespace_to_dict(namespace):
     }
 
 
-def generate_run_id(exp_name):
+def generate_run_id(exp_name, is_resume):
     # https://stackoverflow.com/questions/16008670/how-to-hash-a-string-into-8-digits
-    return str(int(hashlib.sha256(exp_name.encode('utf-8')).hexdigest(), 16) % 10 ** 8)
+    if is_resume:
+        return str(int(hashlib.sha256(exp_name.encode('utf-8')).hexdigest(), 16) % 10 ** 8 + 1)
+    else:
+        return str(int(hashlib.sha256(exp_name.encode('utf-8')).hexdigest(), 16) % 10 ** 8)
 
 
-def initialize(args, entity, exp_name, project_name):
+def initialize(args, entity, exp_name, project_name, is_resume):
     config_dict = namespace_to_dict(args)
     wandb.login(key=os.environ["WANDB_KEY"])
     wandb.init(
-        entity=entity,
-        project=project_name,
-        name=exp_name,
-        config=config_dict,
-        id=generate_run_id(exp_name),
-        resume="allow",
+    entity=entity,
+    project=project_name,
+    name=exp_name,
+    config=config_dict,
+    id=generate_run_id(exp_name, is_resume),
+    resume="allow",
     )
+  
 
 
 def log(stats, step=None):
