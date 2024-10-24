@@ -10,7 +10,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
@@ -30,6 +30,11 @@ from transport import create_transport, Sampler
 from diffusers.models import AutoencoderKL
 from train_utils import parse_transport_args
 import wandb_utils
+
+# HF datasets
+from datasets import load_from_disk
+from torch.utils.data import DataLoader
+from torchvision import transforms
 
 
 #################################################################################
@@ -139,8 +144,11 @@ def main(args):
 
         entity = os.environ["ENTITY"]
         project = os.environ["PROJECT"]
-        if args.wandb:
-            wandb_utils.initialize(args, entity, experiment_name, project)
+        
+        if args.ckpt is not None and args.wandb:
+            wandb_utils.initialize(args, entity, experiment_name, project, True)
+        elif args.ckpt is None and args.wandb:
+            wandb_utils.initialize(args, entity, experiment_name, project, False)
     else:
         logger = create_logger(None)
 
@@ -157,11 +165,13 @@ def main(args):
 
     if args.ckpt is not None:
         ckpt_path = args.ckpt
-        state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict["model"])
-        ema.load_state_dict(state_dict["ema"])
-        opt.load_state_dict(state_dict["opt"])
-        args = state_dict["args"]
+        #state_dict = find_model(ckpt_path)
+        assert os.path.isfile(ckpt_path), f'Could not find SiT checkpoint at {ckpt_path}'
+        
+        checkpoint = torch.load(ckpt_path, map_location=lambda storage, loc: storage)
+        model.load_state_dict(checkpoint["model"])
+        ema.load_state_dict(checkpoint["ema"])
+        args = checkpoint["args"]
 
     requires_grad(ema, False)
     
@@ -179,32 +189,100 @@ def main(args):
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    
+    if args.ckpt is not None:
+        opt.load_state_dict(checkpoint["opt"])
+    
+    if args.huggingface_data:
+        # Setup data:
+        
+        class RemoveAlphaChannel(object):
+            def __call__(self, tensor):
+                # Check if tensor has 4 channels, assuming shape (C, H, W)
+                if tensor.size(0) == 4:
+                    # Remove the alpha channel, keeping only the first 3 channels
+                    tensor = tensor[:3, :, :]
+                return tensor
+        
+        transform = transforms.Compose([
+                RemoveAlphaChannel(), # TODO: Does it make lag?
+                transforms.RandomHorizontalFlip(),
+                transforms.ConvertImageDtype(torch.float),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+                ])
+       
+        # args.data_path = imagenet-1k-centercrop
+        #dataset = load_from_disk(args.data_path).with_format("torch")
+        dataset = load_from_disk('../../imagenet-1k-centercrop').with_format("torch")
+        logger.info(f"Huggingface dataset {args.data_path} is loaded.")
+        
+        class HFDataset(Dataset):
+            def __init__(self, hf_dataset, transform=None):
+                self.hf_dataset = hf_dataset
+                self.transform = transform
 
-    # Setup data:
-    transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
-    dataset = ImageFolder(args.data_path, transform=transform)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=local_batch_size,
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+            def __len__(self):
+                # Return the length of the HuggingFace dataset
+                return len(self.hf_dataset)
+
+            def __getitem__(self, idx):
+                sample = self.hf_dataset[idx]
+                image = sample['image']
+                label = sample['label']
+
+                # Apply transformations if any
+                if self.transform:
+                    image = self.transform(image)
+
+                return image, label
+            
+        dataset = HFDataset(dataset, transform=transform)
+        
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
+        
+        loader = DataLoader(
+            dataset,
+            batch_size=local_batch_size,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        logger.info(f"Dataset contains {len(dataset):,} images (huggingface {args.data_path})")
+
+    else:    
+        # Setup data:
+        transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+        dataset = ImageFolder(args.data_path, transform=transform)
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=local_batch_size,
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+        logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
@@ -239,6 +317,7 @@ def main(args):
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+        
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
@@ -317,6 +396,8 @@ if __name__ == "__main__":
     # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
+    parser.add_argument("--huggingface-data", action="store_true")
+    
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
@@ -328,7 +409,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
-    parser.add_argument("--sample-every", type=int, default=10_000)
+    parser.add_argument("--sample-every", type=int, default=5_000_000) # This makes error so don't sample it
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None,
